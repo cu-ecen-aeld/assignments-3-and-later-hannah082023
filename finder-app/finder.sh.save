@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# 檢查是否輸入了兩個參數
+if [ $# -ne 2 ]; then
+    echo "Error: Please provide exactly two arguments."
+    echo "Usage: $0 <filesdir> <searchstr>"
+    exit 1
+fi
+
+filesdir=$1
+searchstr=$2
+
+# 檢查第一個參數是否為存在的目錄
+if [ ! -d "$filesdir" ]; then
+    echo "Error: Directory '$filesdir' does not exist."
+    exit 1
+fi
+
+# 計算檔案總數
+num_files=$(find "$filesdir" -type f | wc -l)
+
+# 計算匹配的行數
+num_matching_lines=$(grep -r "$searchstr" "$filesdir" 2>/dev/null | wc -
+echo "The number of files are $num_files and the number of matching lines are $num_matching_lines"
