@@ -14,10 +14,8 @@
 #define PORT "9000"
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 
-// 全域變數，用來通知主迴圈是否收到了中斷訊號 (SIGINT / SIGTERM)
 volatile sig_atomic_t caught_signal = 0;
 
-// 訊號處理函式：當按下 Ctrl+C 或被系統 kill 時會觸發
 void signal_handler(int signal_number) {
     if (signal_number == SIGINT || signal_number == SIGTERM) {
         caught_signal = 1;
@@ -26,6 +24,10 @@ void signal_handler(int signal_number) {
 
 int main(int argc, char *argv[]) {
     bool daemon_mode = false;
+    int server_fd, client_fd;
+    struct addrinfo hints, *servinfo, *p;
+    int yes = 1;
+    int rv;
 
     // 1. 檢查是否傳入了 -d 參數 (要求背景執行)
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
@@ -33,13 +35,7 @@ int main(int argc, char *argv[]) {
     }
 
     // 2. 初始化系統日誌 (Syslog)
-    // LOG_USER 表示這是一般使用者的應用程式訊息
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
-
-    // 暫時先用一下這個變數
-    if (daemon_mode) {
-        syslog(LOG_INFO, "Daemon mode specified");
-    }
 
     // 3. 註冊訊號捕捉器 (攔截 SIGINT 和 SIGTERM)
     struct sigaction new_action;
@@ -56,17 +52,13 @@ int main(int argc, char *argv[]) {
     }
 
     // 4. 準備 Socket 位址設定 (Port 9000)
-    int server_fd;
-    struct addrinfo hints, *servinfo, *p;
-    int yes = 1;
-
-    memset(&hints, 0, sizeof(hints));
+    memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;       // 使用 IPv4
     hints.ai_socktype = SOCK_STREAM; // 使用 TCP
     hints.ai_flags = AI_PASSIVE;     // 自動填入本機 IP
 
-    if (getaddrinfo(NULL, PORT, &hints, &servinfo) != 0) {
-        syslog(LOG_ERR, "getaddrinfo failed");
+    if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
+        syslog(LOG_ERR, "getaddrinfo failed: %s", gai_strerror(rv));
         return -1;
     }
 
@@ -75,9 +67,10 @@ int main(int argc, char *argv[]) {
         server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (server_fd == -1) continue;
 
-        // 💡 神奇小設定：避免重開程式時遇到 "Address already in use" 卡住的問題
+        // 避免重開程式時遇到 "Address already in use"
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
             syslog(LOG_ERR, "setsockopt failed");
+            close(server_fd);
             freeaddrinfo(servinfo);
             return -1;
         }
@@ -86,12 +79,11 @@ int main(int argc, char *argv[]) {
             close(server_fd);
             continue;
         }
-        break; // 成功綁定就跳出迴圈
+        break; 
     }
 
-    freeaddrinfo(servinfo); // 用完就釋放記憶體
+    freeaddrinfo(servinfo); 
 
-    // 如果把清單找完還是沒綁成功，就報錯退出
     if (p == NULL) {
         syslog(LOG_ERR, "Failed to bind to port 9000");
         return -1;
@@ -99,8 +91,7 @@ int main(int argc, char *argv[]) {
 
     // 6. 處理 Daemon 背景執行模式 (必須在 bind 成功後)
     if (daemon_mode) {
-        syslog(LOG_INFO, "Entering daemon mode");
-        pid_t pid = fork(); // 分身術！產生子行程
+        pid_t pid = fork();
         
         if (pid < 0) {
             syslog(LOG_ERR, "Fork failed");
@@ -108,81 +99,74 @@ int main(int argc, char *argv[]) {
             return -1;
         }
         if (pid > 0) {
-            // 這是原本的父行程，直接安息結束，讓子行程在背景繼續活著
-            exit(EXIT_SUCCESS); 
+            exit(EXIT_SUCCESS); // 父行程結束
         }
         
-        // --- 以下是存活下來的子行程 (Daemon) 專屬設定 ---
-        setsid(); // 建立新的獨立 Session，脫離原本終端機的控制
-        
-        // 更改工作目錄到根目錄，避免鎖死原本的資料夾無法卸載
-        if (chdir("/") == -1) {
+        // 子行程專屬設定
+        if (setsid() < 0) {
+            syslog(LOG_ERR, "setsid failed");
+            close(server_fd);
+            return -1;
+        }
+        if (chdir("/") < 0) {
             syslog(LOG_ERR, "chdir failed");
             close(server_fd);
             return -1;
         }
         
-        // 將標準輸入、輸出、錯誤都重新導向到「黑洞 (/dev/null)」
-        // 這樣它在背景才不會亂印東西干擾終端機畫面
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
-        open("/dev/null", O_RDWR); // 變成 stdin (0)
-        dup(0);                    // 變成 stdout (1)
-        dup(0);                    // 變成 stderr (2)
+        open("/dev/null", O_RDWR);
+        dup(0); 
+        dup(0); 
     }
 
     // 7. 開始監聽 (Listen)
-    if (listen(server_fd, 5) == -1) { // 允許 5 個連線在門口排隊
+    if (listen(server_fd, 10) == -1) { 
         syslog(LOG_ERR, "Listen failed");
         close(server_fd);
         return -1;
     }
     
-    // 5. 無窮迴圈：等待連線 -> 接收資料 -> 寫入檔案 -> 回傳歷史紀錄 -> 關閉連線
-    while (!caught_signal) {
-        struct sockaddr_storage their_addr;
-        socklen_t sin_size = sizeof their_addr;
-        
-        // 程式會卡在這裡等待，直到有客戶端連線
-        int client_fd = accept(server_fd, (struct sockaddr *)&their_addr, &sin_size);
+    // 8. 無窮迴圈：等待連線 -> 接收資料 -> 寫入檔案 -> 回傳歷史紀錄 -> 關閉連線
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_size = sizeof(client_addr);
+    char buffer[1024];
 
-        // 錯誤處理：如果是因為按下 Ctrl+C 被中斷，就跳出迴圈準備結束程式
+    while (!caught_signal) {
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_size);
+
         if (client_fd == -1) {
-            if (caught_signal) break; 
-            syslog(LOG_ERR, "accept failed");
+            if (caught_signal) break; // 若因收到訊號而中斷，跳出迴圈
             continue;
         }
 
-        // 取得並轉換客戶端的 IP 位址為字串 (為了印 Log)
-        char s[INET6_ADDRSTRLEN];
-        struct sockaddr_in *ipv4 = (struct sockaddr_in *)&their_addr;
-        inet_ntop(AF_INET, &(ipv4->sin_addr), s, sizeof s);
-        syslog(LOG_INFO, "Accepted connection from %s", s);
+        // 記錄連線 IP
+        char *client_ip = inet_ntoa(client_addr.sin_addr);
+        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        // 打開檔案準備寫入 (O_APPEND 代表不會覆蓋，會接續寫在檔案尾巴)
+        // 打開暫存檔準備寫入 (附加模式)
         int file_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (file_fd == -1) {
-            syslog(LOG_ERR, "could not open data file");
+            syslog(LOG_ERR, "Could not open data file for writing");
             close(client_fd);
             continue;
         }
 
         // 接收資料，直到讀到換行符號 (\n)
-        char buffer[1024];
         ssize_t bytes_received;
         bool packet_complete = false;
 
         while (!packet_complete && (bytes_received = recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
             write(file_fd, buffer, bytes_received);
-            // 檢查這包資料裡面有沒有換行符號
             if (memchr(buffer, '\n', bytes_received) != NULL) {
                 packet_complete = true;
             }
         }
-        close(file_fd); // 寫完先關閉檔案
+        close(file_fd);
 
-        // 重新打開檔案，把裡面所有的內容傳回給客戶端
+        // 重新打開檔案，將所有內容回傳給客戶端
         file_fd = open(DATA_FILE, O_RDONLY);
         if (file_fd != -1) {
             ssize_t bytes_read;
@@ -192,15 +176,15 @@ int main(int argc, char *argv[]) {
             close(file_fd);
         }
 
-        // 關閉客戶端連線並記錄
+        // 關閉本次連線
+        syslog(LOG_INFO, "Closed connection from %s", client_ip);
         close(client_fd);
-        syslog(LOG_INFO, "Closed connection from %s", s);
     }
 
-    // 6. 收到中斷訊號後的完美收尾 (Graceful Exit)
+    // 9. 優雅關閉 (Graceful Exit)
     syslog(LOG_INFO, "Caught signal, exiting");
     close(server_fd);
-    remove(DATA_FILE); // 刪除暫存檔
+    remove(DATA_FILE); 
     closelog();
     
     return 0;
