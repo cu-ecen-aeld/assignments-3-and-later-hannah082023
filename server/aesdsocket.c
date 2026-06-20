@@ -29,15 +29,15 @@ int main(int argc, char *argv[]) {
     int yes = 1;
     int rv;
 
-    // 1. 檢查是否傳入了 -d 參數 (要求背景執行)
+    // 每次啟動前，先清除可能殘留的舊暫存檔，確保測試環境乾淨
+    remove(DATA_FILE);
+
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
         daemon_mode = true;
     }
 
-    // 2. 初始化系統日誌 (Syslog)
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
 
-    // 3. 註冊訊號捕捉器 (攔截 SIGINT 和 SIGTERM)
     struct sigaction new_action;
     memset(&new_action, 0, sizeof(struct sigaction));
     new_action.sa_handler = signal_handler;
@@ -51,23 +51,20 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // 4. 準備 Socket 位址設定 (Port 9000)
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;       // 使用 IPv4
-    hints.ai_socktype = SOCK_STREAM; // 使用 TCP
-    hints.ai_flags = AI_PASSIVE;     // 自動填入本機 IP
+    hints.ai_family = AF_INET;       
+    hints.ai_socktype = SOCK_STREAM; 
+    hints.ai_flags = AI_PASSIVE;     
 
     if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
         syslog(LOG_ERR, "getaddrinfo failed: %s", gai_strerror(rv));
         return -1;
     }
 
-    // 5. 建立 Socket 並綁定 (Bind)
     for(p = servinfo; p != NULL; p = p->ai_next) {
         server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (server_fd == -1) continue;
 
-        // 避免重開程式時遇到 "Address already in use"
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
             syslog(LOG_ERR, "setsockopt failed");
             close(server_fd);
@@ -89,7 +86,15 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // 6. 處理 Daemon 背景執行模式 (必須在 bind 成功後)
+    // 💡 關鍵修正 1：必須在 fork 之前開始監聽！
+    // 這樣就算父行程一結束，測試腳本立刻連線，作業系統也能幫我們把連線接住。
+    if (listen(server_fd, 10) == -1) { 
+        syslog(LOG_ERR, "Listen failed");
+        close(server_fd);
+        return -1;
+    }
+
+    // 💡 關鍵修正 2：確保準備就緒後，才進入 Daemon 模式
     if (daemon_mode) {
         pid_t pid = fork();
         
@@ -99,10 +104,9 @@ int main(int argc, char *argv[]) {
             return -1;
         }
         if (pid > 0) {
-            exit(EXIT_SUCCESS); // 父行程結束
+            exit(EXIT_SUCCESS); 
         }
         
-        // 子行程專屬設定
         if (setsid() < 0) {
             syslog(LOG_ERR, "setsid failed");
             close(server_fd);
@@ -121,15 +125,7 @@ int main(int argc, char *argv[]) {
         dup(0); 
         dup(0); 
     }
-
-    // 7. 開始監聽 (Listen)
-    if (listen(server_fd, 10) == -1) { 
-        syslog(LOG_ERR, "Listen failed");
-        close(server_fd);
-        return -1;
-    }
     
-    // 8. 無窮迴圈：等待連線 -> 接收資料 -> 寫入檔案 -> 回傳歷史紀錄 -> 關閉連線
     struct sockaddr_in client_addr;
     socklen_t client_addr_size = sizeof(client_addr);
     char buffer[1024];
@@ -138,15 +134,13 @@ int main(int argc, char *argv[]) {
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_size);
 
         if (client_fd == -1) {
-            if (caught_signal) break; // 若因收到訊號而中斷，跳出迴圈
+            if (caught_signal) break; 
             continue;
         }
 
-        // 記錄連線 IP
         char *client_ip = inet_ntoa(client_addr.sin_addr);
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        // 打開暫存檔準備寫入 (附加模式)
         int file_fd = open(DATA_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (file_fd == -1) {
             syslog(LOG_ERR, "Could not open data file for writing");
@@ -154,7 +148,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // 接收資料，直到讀到換行符號 (\n)
         ssize_t bytes_received;
         bool packet_complete = false;
 
@@ -166,7 +159,6 @@ int main(int argc, char *argv[]) {
         }
         close(file_fd);
 
-        // 重新打開檔案，將所有內容回傳給客戶端
         file_fd = open(DATA_FILE, O_RDONLY);
         if (file_fd != -1) {
             ssize_t bytes_read;
@@ -176,12 +168,10 @@ int main(int argc, char *argv[]) {
             close(file_fd);
         }
 
-        // 關閉本次連線
         syslog(LOG_INFO, "Closed connection from %s", client_ip);
         close(client_fd);
     }
 
-    // 9. 優雅關閉 (Graceful Exit)
     syslog(LOG_INFO, "Caught signal, exiting");
     close(server_fd);
     remove(DATA_FILE); 
